@@ -15,56 +15,200 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
 static thread_func start_process NO_RETURN;
+static char *get_file_name (const char *cmdline);
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static struct thread_child *current_thread_get_child (pid_t pid);
+static void remove_child (struct thread_child *child);
+static void thread_remove_children (void);
+static void close_all_files (void);
+void fd_close (struct file_directory_entry *f);
+static void setup_stack_args (void **esp, char *file_name, char **save_ptr);
+
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *cmdline) 
 {
   char *fn_copy;
-  tid_t tid;
+  char *file_name;
+  tid_t child_tid;
+  struct thread_child *child;
+ 
+  	
+  int load_msg;
 
-  /* Make a copy of FILE_NAME.
+  /* Make a copy of CMDLINE.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+  strlcpy (fn_copy, cmdline, PGSIZE);
+
+  file_name = get_file_name (cmdline);
+
+  if (file_name == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+
+  /* Allocate the child represent this process
+     to push into the parent CHILD_LIST. */
+    child = malloc (sizeof (struct thread_child));
+
+  if (child == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
-  return tid;
+    child_tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+
+
+    if (child_tid == TID_ERROR)
+      palloc_free_page (fn_copy);
+
+
+  free (file_name);
+
+  /*itialize a thread_child object for the new created thread
+	and wakes the child thread to continue it's creation
+  */
+
+  struct thread *t;
+  child->tid = child_tid;
+  t = thread_get (child_tid);
+  sema_init (&child->semaphore_object.sema, 0);
+  t->semaphore_object = &(child->semaphore_object);
+  sema_up (&t->thread_ready);
+
+  /*waits for a message from threads child to see if it's created correctly or not*/
+  sema_down (&child->semaphore_object.sema);
+  load_msg = child->semaphore_object.has_error;
+  
+
+
+
+  /* Checks if the child fails in loading the executable. */
+  if (load_msg == -1)
+    {
+      free (child);
+      return TID_ERROR;
+    }
+
+  /*add the child to child list of its parent*/
+  list_push_back (&thread_current ()->child_list, &child->elem);
+  return child_tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *cmdline_)
 {
-  char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
+  struct thread *cur = thread_current ();
+
+  char *token_, *esp_;    			//Used for adding the the args to the stack
+  char *token, *save_ptr;			//Used in the string splitting
+  int i;							//For the loop
+  char* addrs[100];					//Used to save the addresses of the arguments in the stack
+  int num_of_args = 0;				//Save number of arguments
+  char *full_arg = malloc(strlen(cmdline_) + 1);	//To save the full cmd line to cut it, save place in memory for it
+  strlcpy(full_arg, cmdline_, strlen(cmdline_) + 1);	//Copy cmd line into full_arg
+  int full_length = 0;				//For the allignment
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (cmdline_, &if_.eip, &if_.esp);
+
+  if(success){
+  	if(strlen(cmdline_) > PGSIZE){
+  		success = false;
+  	}
+  }
+
+  if(success){
+  	/* A loop on the arguments to cut the full argument into separate srtings, copy the arguments to the stack, edit the esp pointer,
+  	   save the addresses of the arguments in the addrs array and increment num_of_arguments */
+	for(token = strtok_r(full_arg, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr))
+	{
+		//Decrease the pointer by the length of the argument plus 1 for the '\0'
+		if_.esp -= (strlen(token) + 1);
+		//Add the address to the addrs array and increment the num_of_argumetns
+		addrs[num_of_args++] = (char *)if_.esp; 
+		//Make esp point tp the same as interupt frame's esp
+		esp_ = (char *)if_.esp;
+		//Make token_ points to the same string as token
+		token_ = token;
+		//coping the string in token to esp byte by byte
+		while(*token_ != '\0'){
+			*esp_++ = *token_++;
+		}
+		//Add the end of string character
+		*esp_ = '\0';
+		//Add the argument length to full_length
+		full_length += strlen(token);
+	}
+	//Add the allignment bytes
+	for(i = 0; i < (full_length % 4); i++){
+		if_.esp -= 1;
+		*((uint8_t *)if_.esp) = 0;
+	}
+	//Add null pointer sentinal
+	if_.esp -= 4;
+    *((char *)if_.esp) = 0;
+    //Add the addresses of the arguments
+	for(i = num_of_args - 1; i >= 0; i--){
+		if_.esp -= 4;
+		*((char **)if_.esp) = addrs[i];
+	}
+	//Add the address of the first address of the arguments
+	if_.esp -= 4;
+	*((char ***)if_.esp) = (if_.esp + 4);
+	//Add the number of arguments
+	if_.esp -= 4;
+	*((int *)if_.esp) = num_of_args;
+	//Add the fake return address
+	if_.esp -= 4;
+	*((int *)if_.esp) = 0;
+
+
+  }
+
+
+  /* child sleeps it self tell parent intialize the sharable semaphore object */
+  sema_down (&cur->thread_ready);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
+  palloc_free_page (cmdline_);
   if (!success) 
-    thread_exit ();
+    {
+      cur->terminate_status = -1;
+      cur->semaphore_object->has_error = -1;
+  	  sema_up (&cur->semaphore_object->sema);
+      thread_exit ();
+    }
+  else
+    {
+      /* Sends message to the parent to informs it with loading*/
+    	cur->semaphore_object->has_error = 1;
+  	  	sema_up (&cur->semaphore_object->sema);
+    }
+
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -88,7 +232,22 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  return -1;
+  struct thread_child *child = current_thread_get_child (child_tid);
+
+  if (child == NULL )
+    return -1;
+
+  /* Waits for the child to exit and send its exit status. */
+  sema_down (&child->semaphore_object.sema);
+  int exit_msg = child->semaphore_object.has_error;
+
+
+
+  /* Removes child to ensure that the parent waits on
+     its child at most once. */
+  remove_child (child);
+
+  return exit_msg;
 }
 
 /* Free the current process's resources. */
@@ -98,6 +257,22 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  printf ("%s: exit(%d)\n", cur->name, cur->terminate_status);
+  
+  /* Releases all the resources of the thread. */
+  close_all_files ();
+  thread_remove_children ();
+  
+  if (cur->semaphore_object != NULL){
+  	/* Sends a message to the parent contains exit status. */
+  	  cur->semaphore_object->has_error = cur->terminate_status;
+  	  sema_up (&cur->semaphore_object->sema);
+  }
+    
+
+  /* Releases locks if acquired. */
+  if (lock_held_by_current_thread (&file_lock))
+    lock_release (&file_lock);
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -206,20 +381,30 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
    and its initial stack pointer into *ESP.
    Returns true if successful, false otherwise. */
 bool
-load (const char *file_name, void (**eip) (void), void **esp) 
+load (const char *cmdline_, void (**eip) (void), void **esp)
 {
   struct thread *t = thread_current ();
   struct Elf32_Ehdr ehdr;
   struct file *file = NULL;
   off_t file_ofs;
   bool success = false;
-  int i;
+  int i;					//For the loop
+  char *cmdline;			//to copy the cmdline_ to not destroy it
+  char *file_name;			//String to save the file name without the arguments to be excuted 
+  char *save_ptr;			//For strtok_r
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
     goto done;
   process_activate ();
+
+  cmdline = malloc ((strlen(cmdline_) + 1));		//Save space for cmdline
+  if (cmdline == NULL)
+      goto done;
+  strlcpy (cmdline, cmdline_, PGSIZE);				//Copy cmdline_ to cmdline
+
+  file_name = strtok_r (cmdline, " ", &save_ptr);	//Save the file name to file_name
 
   /* Open executable file. */
   file = filesys_open (file_name);
@@ -305,14 +490,24 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (!setup_stack (esp))
     goto done;
 
+  free (cmdline);
+
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
   success = true;
 
  done:
-  /* We arrive here whether the load is successful or not. */
-  file_close (file);
+ /* We arrive here whether the load is successful or not. */
+  if (success)
+   {
+     thread_current ()->executable = file;
+     /* Denies write to executable files. */
+     file_deny_write (file);
+   }
+  else
+    file_close (file);
+
   return success;
 }
 
@@ -463,3 +658,93 @@ install_page (void *upage, void *kpage, bool writable)
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
+
+
+//static char *extract_file_name (const char *cmdline)
+static char *get_file_name (const char *cmdline)
+{
+  char *save_ptr;
+  char *file_name = malloc ((strlen (cmdline) + 1) * sizeof(char));
+
+  if (file_name == NULL)
+      return NULL;
+
+  strlcpy (file_name, cmdline, PGSIZE);
+  file_name = strtok_r (file_name, " ", &save_ptr);
+
+  return file_name;
+}
+
+
+static void remove_child (struct thread_child *child)
+{
+	struct thread *c = thread_get (child->tid);
+
+  /* Destroys the shared mailbox. */
+  if (c != NULL)
+  	c->semaphore_object = NULL;
+
+  /* Removes child from the parent CHILD_LIST. */
+  list_remove (&child->elem);
+  /* Destroys the child. */
+  free (child);
+}
+
+static struct thread_child *current_thread_get_child (pid_t pid)
+{
+  struct list_elem *e;
+  struct thread *parent = thread_current ();
+
+  for (e = list_begin (&parent->child_list); e != list_end (&parent->child_list);
+       e = list_next (e))
+    {
+      struct thread_child *c = list_entry (e, struct thread_child, elem);
+      if (c->tid == pid)
+        return c;
+    }
+
+  return NULL;
+}
+
+void
+fd_close (struct file_directory_entry *f)
+{
+  lock_acquire (&file_lock);
+  file_close (f->file);
+  lock_release (&file_lock);
+  list_remove (&f->elem);
+  free (f);
+}
+
+
+static void
+close_all_files (void)
+{
+  struct thread *cur = thread_current ();
+  struct list_elem *e = list_begin (&cur->opened_files);
+  
+  while (e != list_end (&cur->opened_files))
+    {
+      struct file_directory_entry *f = list_entry (e, struct file_directory_entry, elem);
+      e = list_next (e);
+      fd_close (f);
+    }
+
+  file_close (cur->executable);
+}
+
+//this method iterate for all thread's children and removes them by calling remove_child() method
+static void
+thread_remove_children (void)
+{
+   struct thread *cur = thread_current ();
+   struct list_elem *e = list_begin (&cur->child_list);;
+
+   while (e != list_end (&cur->child_list))
+     {
+      struct thread_child *child = list_entry (e, struct thread_child, elem);
+       e = list_next (e);
+       remove_child (child);
+     }
+}
+

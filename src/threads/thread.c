@@ -528,6 +528,19 @@ init_thread (struct thread *t, const char *name, int priority)
    t->recent_cpu = thread_current()->recent_cpu;
   }
   list_push_back (&all_list, &t->allelem);
+
+  //#ifdef USERPROG
+
+  list_init (&t->child_list);
+  //t->exit_status = 0;
+  t->terminate_status = 0;
+  //t->mailbox = NULL;
+  t->semaphore_object = NULL;
+  //sema_init (&t->mailbox_setup, 0);
+  sema_init(&t->thread_ready , 0);
+
+  list_init (&t->opened_files);
+//#endif
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -793,3 +806,26 @@ threads_update_priority(void){
 }
 
 /************************/
+
+
+
+struct thread *thread_get (tid_t tid)
+{
+  struct list_elem *e;
+  enum intr_level old_level;
+
+  old_level = intr_disable ();
+
+  for (e = list_begin (&all_list); e != list_end (&all_list);
+       e = list_next (e))
+    {
+      struct thread *t = list_entry (e, struct thread, allelem);
+      if (t->tid == tid)
+        return t;
+    }
+
+  intr_set_level (old_level);
+
+  return NULL;
+}
+

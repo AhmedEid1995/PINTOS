@@ -7,6 +7,29 @@
 #include <stdint.h>
 #include "threads/synch.h"
 
+typedef int tid_t;
+typedef int pid_t;
+
+
+struct semaphore_object
+{
+  struct semaphore sema;
+  int has_error;
+};
+
+
+
+
+struct thread_child
+{
+  pid_t tid;			/* Child identifier. */
+  struct semaphore_object semaphore_object;   /* Child mailbox. */
+  /* Shared between process.c and thread.c. */
+  struct list_elem elem;
+};
+
+
+
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -19,7 +42,7 @@ enum thread_status
 
 /* Thread identifier type.
    You can redefine this to whatever type you like. */
-typedef int tid_t;
+
 #define TID_ERROR ((tid_t) -1)          /* Error value for tid_t. */
 
 /* Thread priorities. */
@@ -111,11 +134,20 @@ struct thread
     int recent_cpu;
 
 
-
+struct list child_list;             /* List of child processes created by this thread. */					          
+int terminate_status;		    /* determines the state of thread */
+struct semaphore_object *semaphore_object;/* a semaphore shared between parent and its child + child identifier */
+struct semaphore thread_ready; 	    /* semaphore used to sleep and wakes the current thread*/
+struct list opened_files;           /* List of files opened with this thread. */
+struct file *executable;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
-    uint32_t *pagedir;                  /* Page directory. */
+uint32_t *pagedir;                  /* Page directory. */
+
+
+
+
 #endif
 
     /* Owned by thread.c. */

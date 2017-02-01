@@ -4,6 +4,8 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "process.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -89,6 +91,7 @@ kill (struct intr_frame *f)
       printf ("%s: dying due to interrupt %#04x (%s).\n",
               thread_name (), f->vec_no, intr_name (f->vec_no));
       intr_dump_frame (f);
+      thread_current ()->terminate_status = -1;
       thread_exit (); 
 
     case SEL_KCSEG:
@@ -104,6 +107,7 @@ kill (struct intr_frame *f)
          kernel. */
       printf ("Interrupt %#04x (%s) in unknown segment %04x\n",
              f->vec_no, intr_name (f->vec_no), f->cs);
+      thread_current ()->terminate_status = -1;
       thread_exit ();
     }
 }
@@ -147,6 +151,16 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
+
+  /* Checks if the fault in kernel context. */
+  if (!user)
+    {
+      f->eip = (void (*)(void))f->eax;
+      f->eax= 0xffffffff;
+    }
+  
+    thread_current ()->terminate_status = -1;
+    thread_exit ();
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
